@@ -1,0 +1,2 @@
+# Backend uses only the Python standard library (see backend/app/compat.py).
+# Python >= 3.10. No third-party runtime dependencies.

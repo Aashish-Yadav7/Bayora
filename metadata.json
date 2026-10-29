@@ -1,0 +1,6 @@
+{
+  "name": "Bayora Systems — Adversarial AI Safety & Isolation Control Plane",
+  "description": "Role-isolated adversarial AI safety testing environment with Red Team, Blue Team, and Evaluator boundaries, strict lifecycle state machine, deterministic mock target adapter, and zero-leakage audit evidence.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

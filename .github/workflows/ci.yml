@@ -1,0 +1,32 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - run: pip install pyyaml
+      - run: python -m unittest discover -s backend/tests -v
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - run: npm install
+      - run: npm run lint
+      - run: npm run build
+      - run: npm run test:unit
+  docker-isolation:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create .env with random secrets
+        run: |
+          for v in AUTH_SECRET RED_WORKER_TOKEN BLUE_WORKER_TOKEN EVALUATOR_TOKEN ADAPTER_TOKEN; do echo "BAYORA_$v=$(openssl rand -hex 24)" >> .env; done
+      - run: docker compose up -d --build --wait
+      - run: ./scripts/verify_isolation.sh
+      - if: failure()
+        run: docker compose logs

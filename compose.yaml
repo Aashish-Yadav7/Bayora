@@ -1,0 +1,173 @@
+name: bayora-systems
+
+services:
+  control-plane:
+    build:
+      context: .
+      dockerfile: infra/docker/backend.Dockerfile
+    user: "10000:10000"
+    read_only: true
+    tmpfs:
+      - /tmp:size=32M,mode=1770
+    volumes:
+      - bayora-sqlite-data:/app/data
+    environment:
+      - BAYORA_DB_PATH=/app/data/bayora.db
+      - BAYORA_AUTH_SECRET=${BAYORA_AUTH_SECRET:?set BAYORA_AUTH_SECRET in .env}
+      - BAYORA_ADAPTER_URL=http://target-adapter:8100
+      - BAYORA_ADAPTER_TOKEN=${BAYORA_ADAPTER_TOKEN:?set BAYORA_ADAPTER_TOKEN}
+      - BAYORA_RED_WORKER_TOKEN=${BAYORA_RED_WORKER_TOKEN:?set BAYORA_RED_WORKER_TOKEN}
+      - BAYORA_BLUE_WORKER_TOKEN=${BAYORA_BLUE_WORKER_TOKEN:?set BAYORA_BLUE_WORKER_TOKEN}
+      - BAYORA_EVALUATOR_TOKEN=${BAYORA_EVALUATOR_TOKEN:?set BAYORA_EVALUATOR_TOKEN}
+      - BAYORA_BACKEND_HOST=0.0.0.0
+      - BAYORA_BACKEND_PORT=8000
+      - BAYORA_TARGET_ADAPTER_MODE=${BAYORA_TARGET_ADAPTER_MODE:-MOCK_DETERMINISTIC_V1}
+      - BAYORA_EXECUTION_TIMEOUT_MS=${BAYORA_EXECUTION_TIMEOUT_MS:-5000}
+    networks:
+      - control-net
+      - red-net
+      - blue-net
+    # no host port: the backend is reachable only through the frontend gateway on control-net
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    deploy:
+      resources:
+        limits:
+          cpus: "0.75"
+          memory: 512M
+        reservations:
+          cpus: "0.25"
+          memory: 128M
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=3)"]
+      interval: 10s
+      timeout: 4s
+      retries: 3
+
+  red-worker:
+    build:
+      context: .
+      dockerfile: workers/red/Dockerfile
+    user: "10001:10001"
+    read_only: true
+    tmpfs:
+      - /tmp:size=16M,mode=1770
+    environment:
+      - BAYORA_CONTROL_PLANE_URL=http://control-plane:8000
+      - BAYORA_RED_WORKER_TOKEN=${BAYORA_RED_WORKER_TOKEN:?set BAYORA_RED_WORKER_TOKEN}
+    networks:
+      - red-net
+    depends_on:
+      control-plane:
+        condition: service_healthy
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    deploy:
+      resources:
+        limits:
+          cpus: "0.50"
+          memory: 256M
+        reservations:
+          cpus: "0.10"
+          memory: 64M
+
+  blue-worker:
+    build:
+      context: .
+      dockerfile: workers/blue/Dockerfile
+    user: "10002:10002"
+    read_only: true
+    tmpfs:
+      - /tmp:size=16M,mode=1770
+    environment:
+      - BAYORA_CONTROL_PLANE_URL=http://control-plane:8000
+      - BAYORA_BLUE_WORKER_TOKEN=${BAYORA_BLUE_WORKER_TOKEN:?set BAYORA_BLUE_WORKER_TOKEN}
+    networks:
+      - blue-net
+    depends_on:
+      control-plane:
+        condition: service_healthy
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    deploy:
+      resources:
+        limits:
+          cpus: "0.50"
+          memory: 256M
+        reservations:
+          cpus: "0.10"
+          memory: 64M
+
+  target-adapter:
+    build:
+      context: .
+      dockerfile: workers/target-adapter/Dockerfile
+    user: "10003:10003"
+    read_only: true
+    tmpfs:
+      - /tmp:size=32M,mode=1770
+    environment:
+      - BAYORA_TARGET_ADAPTER_MODE=${BAYORA_TARGET_ADAPTER_MODE:-MOCK_DETERMINISTIC_V1}
+      - BAYORA_ADAPTER_TOKEN=${BAYORA_ADAPTER_TOKEN:?set BAYORA_ADAPTER_TOKEN}
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+    networks:
+      - control-net
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    deploy:
+      resources:
+        limits:
+          cpus: "0.50"
+          memory: 256M
+        reservations:
+          cpus: "0.10"
+          memory: 64M
+
+  frontend:
+    build:
+      context: .
+      dockerfile: infra/docker/frontend.Dockerfile
+    user: "10004:10004"
+    environment:
+      - BAYORA_BACKEND_URL=http://control-plane:8000
+      - BAYORA_DEV_HEADER_AUTH=${BAYORA_DEV_HEADER_AUTH:-0}
+      - BAYORA_RED_WORKER_TOKEN=${BAYORA_RED_WORKER_TOKEN:?set BAYORA_RED_WORKER_TOKEN}
+      - BAYORA_BLUE_WORKER_TOKEN=${BAYORA_BLUE_WORKER_TOKEN:?set BAYORA_BLUE_WORKER_TOKEN}
+      - BAYORA_EVALUATOR_TOKEN=${BAYORA_EVALUATOR_TOKEN:?set BAYORA_EVALUATOR_TOKEN}
+    networks:
+      - control-net
+    ports:
+      - "3000:3000"
+    depends_on:
+      control-plane:
+        condition: service_healthy
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    deploy:
+      resources:
+        limits:
+          cpus: "0.50"
+          memory: 512M
+
+networks:
+  red-net:
+    driver: bridge
+    internal: true
+  blue-net:
+    driver: bridge
+    internal: true
+  control-net:
+    driver: bridge
+
+volumes:
+  bayora-sqlite-data:
