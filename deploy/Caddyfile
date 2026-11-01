@@ -1,0 +1,10 @@
+# Optional TLS termination: docker compose --profile tls up -d --build  ->  https://localhost:8443
+{
+	admin off
+	auto_https disable_redirects
+}
+
+https://localhost:8443 {
+	tls internal
+	reverse_proxy frontend:3000
+}

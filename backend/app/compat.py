@@ -355,4 +355,11 @@ def run_http_server(app: BayoraRouterApp, host: str = "127.0.0.1", port: int = 8
             return
 
     server = ThreadingHTTPServer((host, port), Handler)
+    cert, key = os.environ.get("BAYORA_TLS_CERT"), os.environ.get("BAYORA_TLS_KEY")
+    if cert and key:  # optional native TLS (otherwise terminate TLS in a reverse proxy, see deploy/Caddyfile)
+        import ssl
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        ctx.load_cert_chain(cert, key)
+        server.socket = ctx.wrap_socket(server.socket, server_side=True)
     server.serve_forever()

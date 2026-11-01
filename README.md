@@ -88,7 +88,7 @@ docker compose up --build
 cp .env.example .env            # fill every secret with random values: openssl rand -hex 32
 docker compose up -d --build    # frontend: http://localhost:3000
 ./scripts/verify_isolation.sh   # REAL connection attempts from inside the containers
-python3 -m unittest discover -s backend/tests -v   # 118 backend tests
+python3 -m unittest discover -s backend/tests -v   # 181 backend tests
 ```
 
 **Authentication:** callers use `Authorization: Bearer <token>`. Tokens are HMAC-signed, expire (1h default) and are
@@ -119,8 +119,8 @@ Docker isolation check on every push, so push this repo to GitHub to get the Doc
 `POST /api/audit/checkpoint/verify` it. This detects even a full-chain rewrite. Set a separate `BAYORA_AUDIT_KEY` to keep the key apart from login secrets.
 
 ## Tests and known limitations (current)
-`python3 -m unittest discover -s backend/tests -v` runs 118 tests in two files: `test_security_suite.py` (original + auth/audit/report
-fixes) and `test_extended.py` (role matrix, lifecycle, validation, secret leakage, auth edge cases, audit tamper/checkpoint,
+`python3 -m unittest discover -s backend/tests -v` runs 181 tests in five files: `test_security_suite.py` (original + auth/audit/report
+fixes) `test_hardening.py` (MFA, password change/reset, disable, cookie/CSRF static checks), `test_accounts.py` (accounts, assignments, DB throttle, TLS, CLI) and `test_extended.py` (role matrix, lifecycle, validation, secret leakage, auth edge cases, audit tamper/checkpoint,
 adapters + adapter service, concurrency, real-HTTP behaviour, DB migration, deployment-config checks). Each test has a docstring
 stating the failure it prevents. Deployment-config tests need PyYAML (`pip install pyyaml`) and are skipped without it.
 
@@ -128,9 +128,36 @@ Fixed in this version: atomic compare-and-set state transitions (no double start
 type, strict JSON type checks (no 500s), slow-client timeouts, Gemini requires `BAYORA_ALLOW_EXTERNAL_MODEL=1` and records data
 egress, production CSP on the gateway, demo data opt-in.
 
-Still limitations (by design / not verifiable here):
-- One shared credential per role, no per-person accounts, no per-test ownership: any Red user can write to any test.
-- No TLS inside the stack; put a TLS-terminating reverse proxy in front for anything beyond localhost.
-- Login throttling and the unauthenticated-audit limiter are in-memory (reset on restart, not shared across processes).
-- Tokens live in `sessionStorage` (CSP reduces, does not remove, XSS risk).
-- Docker build, frontend build and the live Gemini call are unverified here; CI (`.github/workflows/ci.yml`) runs them.
+## Accounts, assignments and TLS (new)
+```bash
+# 1. create the first evaluator account (password min 12 chars; prompts if BAYORA_NEW_PASSWORD is unset)
+BAYORA_DB_PATH=bayora.db python3 -m backend.app.users_cli add alice EVALUATOR
+# 2. sign in from the dashboard: "Sign in" -> username + password (leave username blank for the shared role credential)
+# 3. evaluator creates more people:  POST /api/users {username, role, password}
+# 4. evaluator assigns people to a test:  POST /api/tests/{id}/participants {actor: "<username>", role: "RED_TEAM"}
+```
+- Audit entries name the individual (the username), assigned by the server from the users table.
+- Once any Red (or Blue) person is assigned to a test, only assigned people of that role can read/write its artifacts; tests with no
+  assignments stay open to the role (backward compatible). Set `BAYORA_DISABLE_ROLE_CREDENTIALS=1` to force personal accounts.
+- Login throttling and the unauthenticated-audit limiter are stored in the database (survive restarts, shared across processes).
+- TLS: `docker compose --profile tls up -d --build` serves https://localhost:8443 through Caddy, or set `BAYORA_TLS_CERT` and
+  `BAYORA_TLS_KEY` for native TLS on the backend.
+
+### Sessions, MFA and account management (latest)
+- **Sessions:** the gateway stores the token in an `HttpOnly; SameSite=Strict` cookie (set `BAYORA_COOKIE_SECURE=1` behind HTTPS);
+  page scripts never see it. Cookie-authenticated writes must send `X-Requested-With: bayora` (CSRF defence). API clients/workers
+  still use `Authorization: Bearer`. The sign-in dialog masks the password and asks for the authenticator code when needed.
+- **MFA (TOTP):** `POST /api/auth/mfa/enroll` then `/api/auth/mfa/confirm {code}`; afterwards login needs `otp`. Codes are single-use,
+  guessing is throttled, and an evaluator can reset lost MFA (`POST /api/users/{name}/mfa/reset`).
+- **Passwords/accounts:** `POST /api/auth/password`; evaluator `POST /api/users/{name}/reset-password|disable|enable`. Any password
+  change, reset, disable or MFA reset instantly invalidates that user's earlier tokens. Red/Blue users do not see tests they are not assigned to.
+
+Remaining limitations (not verifiable here / by design):
+- No self-service "forgot password" email flow (an evaluator resets passwords); no hardware-key (WebAuthn) support.
+- The frontend build, Docker build, Caddy TLS profile and live Gemini call are unverified here; CI (`.github/workflows/ci.yml`) runs them.
+
+## New chat-style UI (web + phone)
+The default screen is now a WhatsApp-style app: tests are the chat list (left), the selected test is a conversation (right) with
+Red/Blue message bubbles, state chips, a results card and a role-aware composer. On phones it is one pane at a time with a slide
+transition, safe-area padding, and light/dark themes. Hidden content stays hidden: other teams' messages show as locked bubbles.
+The original dashboard is still available at `/?classic=1`. Frontend unit tests: `npm run test:unit` (needs `npm install`).

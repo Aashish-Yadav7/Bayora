@@ -9,13 +9,17 @@ const PYTHON_PORT = Number(process.env.BAYORA_BACKEND_PORT || 8000);
 const REMOTE_BACKEND = process.env.BAYORA_BACKEND_URL ? new URL(process.env.BAYORA_BACKEND_URL) : null;
 const PYTHON_HOST = REMOTE_BACKEND ? REMOTE_BACKEND.hostname : '127.0.0.1';
 const BACKEND_PORT = REMOTE_BACKEND ? Number(REMOTE_BACKEND.port || 80) : PYTHON_PORT;
+// Windows usually has `python` (or the `py` launcher), not `python3`. Override with BAYORA_PYTHON.
+const PYTHON_CMD = process.env.BAYORA_PYTHON || (process.platform === 'win32' ? 'python' : 'python3');
+const COOKIE = 'bayora_session';
+const COOKIE_SECURE = process.env.BAYORA_COOKIE_SECURE === '1' ? '; Secure' : '';
 const DEV_HEADER_AUTH = process.env.BAYORA_DEV_HEADER_AUTH === '1';
 
 let pythonProc: ChildProcess | null = null;
 
 function startPythonBackend(): Promise<void> {
   return new Promise((resolve, reject) => {
-    if (!REMOTE_BACKEND) pythonProc = spawn('python3', ['-m', 'backend.app.main'], {
+    if (!REMOTE_BACKEND) pythonProc = spawn(PYTHON_CMD, ['-m', 'backend.app.main'], {
       cwd: process.cwd(),
       env: {
         ...process.env,
@@ -80,6 +84,35 @@ function devLogin(role: string, actor: string): Promise<string | null> {
     );
     r.on('error', () => resolve(null));
     r.end(body);
+  });
+}
+
+function readCookie(req: express.Request, name: string): string | null {
+  for (const part of (req.headers.cookie || '').split(';')) {
+    const [k, ...v] = part.trim().split('=');
+    if (k === name) {
+      try { return decodeURIComponent(v.join('=')); } catch { return null; }
+    }
+  }
+  return null;
+}
+
+function backendCall(path: string, body: unknown, token: string | null): Promise<{ status: number; data: any }> {
+  return new Promise((resolve) => {
+    const payload = JSON.stringify(body ?? {});
+    const headers: Record<string, string | number> = { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) };
+    if (token) headers['Authorization'] = `Bearer ${token}`;
+    const r = http.request({ hostname: PYTHON_HOST, port: BACKEND_PORT, path, method: 'POST', headers }, (resp) => {
+      let d = '';
+      resp.on('data', (c) => (d += c));
+      resp.on('end', () => {
+        let data: any = {};
+        try { data = JSON.parse(d); } catch { /* keep {} */ }
+        resolve({ status: resp.statusCode || 502, data });
+      });
+    });
+    r.on('error', () => resolve({ status: 502, data: { error: 'BACKEND_UNREACHABLE' } }));
+    r.end(payload);
   });
 }
 
@@ -150,13 +183,38 @@ async function startServer() {
   app.use(express.json({ limit: '1mb' }));
 
   // Proxy all /api/* calls directly to the Python Control Plane backend
+  // Session cookie handling: the token is stored HttpOnly/SameSite=Strict and never returned to page scripts.
+  app.post('/api/auth/login', async (req, res) => {
+    const out = await backendCall('/api/auth/login', req.body, null);
+    if (out.status === 200 && out.data.token) {
+      res.setHeader('Set-Cookie', `${COOKIE}=${encodeURIComponent(out.data.token)}; HttpOnly; SameSite=Strict; Path=/; Max-Age=3600${COOKIE_SECURE}`);
+      res.status(200).json({ role: out.data.role, authenticated: true });
+      return;
+    }
+    res.status(out.status).json(out.data);
+  });
+
+  app.post('/api/auth/logout', async (req, res) => {
+    const bearer = String(req.headers['authorization'] || '').replace(/^Bearer\s+/i, '');
+    const token = bearer || readCookie(req, COOKIE);
+    if (token) await backendCall('/api/auth/logout', {}, token);
+    res.setHeader('Set-Cookie', `${COOKIE}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0${COOKIE_SECURE}`);
+    res.status(200).json({ revoked: Boolean(token) });
+  });
+
   app.all('/api/*splat', async (req, res) => {
+    const cookieToken = req.headers['authorization'] ? null : readCookie(req, COOKIE);
+    // CSRF defence for cookie sessions: state-changing calls must carry a header a cross-site form cannot set.
+    if (cookieToken && !['GET', 'HEAD', 'OPTIONS'].includes(req.method) && req.headers['x-requested-with'] !== 'bayora') {
+      res.status(403).json({ error: 'CSRF_CHECK_FAILED', message: 'Missing X-Requested-With header.' });
+      return;
+    }
     let devToken: string | null = null;
     const role = String(req.headers['x-bayora-role'] || '').toUpperCase();
-    if (DEV_HEADER_AUTH && !req.headers['authorization'] && role) {
+    if (DEV_HEADER_AUTH && !req.headers['authorization'] && !cookieToken && role) {
       devToken = await devLogin(role, String(req.headers['x-bayora-actor'] || ''));
     }
-    proxyToPython(req, res, devToken);
+    proxyToPython(req, res, cookieToken ?? devToken);
   });
 
   if (process.env.NODE_ENV !== 'production') {

@@ -11,7 +11,7 @@
     "clean": "rm -rf dist server.js",
     "lint": "tsc --noEmit",
     "test:backend": "python3 -m unittest discover -s backend/tests -v",
-    "test:unit": "tsx --test src/lib/bayoraLogic.test.ts"
+    "test:unit": "tsx --test src/lib/bayoraLogic.test.ts src/chat/timeline.test.ts"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",
@@ -30,7 +30,6 @@
     "@types/react": "^19.3.0",
     "@types/react-dom": "^19.3.0",
     "autoprefixer": "^10.4.21",
-    "esbuild": "^0.25.0",
     "tailwindcss": "^4.3.3",
     "tsx": "^4.21.0",
     "typescript": "^7.0.2",

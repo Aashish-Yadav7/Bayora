@@ -204,13 +204,11 @@ class TestBayoraSecurityEvidence(unittest.TestCase):
 
     def test_login_lockout_after_repeated_failures(self) -> None:
         import backend.app.auth as A
-        A._FAILS.clear()
         for _ in range(5):
             self.assertEqual(self.client.post("/api/auth/login", json={"role": "EVALUATOR", "credential": "x"}).status_code, 401)
         self.assertEqual(self.client.post("/api/auth/login", json={"role": "EVALUATOR", "credential": "x"}).status_code, 429)
         ok = self.client.post("/api/auth/login", json={"role": "EVALUATOR", "credential": "eval-credential-01234567"})
         self.assertEqual(ok.status_code, 200)  # correct credential is never locked out
-        A._FAILS.clear()
 
     def test_unauthenticated_flood_is_throttled(self) -> None:
         for _ in range(20):

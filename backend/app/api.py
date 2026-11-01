@@ -31,7 +31,8 @@ import os
 
 from .adapters import DeterministicMockLLMAdapter, GeminiAdapter, RemoteAdapter
 from .audit import AuditLogger
-from .auth import ActorIdentity, Role, authenticate_request, login as auth_login
+from .auth import (ActorIdentity, Role, authenticate_request, create_user, ensure_tables, login as auth_login,
+                   login_user, new_totp_secret, set_password, _throttle_or_fail, verify_password, verify_totp)
 from .compat import BaseModel, BayoraRouterApp, Field, HTTPException, RequestContext
 from .database import DatabaseManager
 from .lifecycle import TestState, validate_state_transition
@@ -69,9 +70,35 @@ class SubmitBlueDefenseRequest(BaseModel):
 
 
 class LoginRequest(BaseModel):
+    role: str = Field(default="RED_TEAM", min_length=3, max_length=32)  # ignored for username logins
+    credential: str = Field(..., min_length=1, max_length=256)          # password (username login) or role credential
+    actor: str = Field(default="", max_length=80)                       # ignored: the server assigns identity
+    username: str = Field(default="", max_length=40)
+    otp: str = Field(default="", max_length=12)
+
+
+class PasswordChangeRequest(BaseModel):
+    current_password: str = Field(..., min_length=1, max_length=128)
+    new_password: str = Field(..., min_length=12, max_length=128)
+
+
+class ResetPasswordRequest(BaseModel):
+    new_password: str = Field(..., min_length=12, max_length=128)
+
+
+class MfaConfirmRequest(BaseModel):
+    code: str = Field(..., min_length=6, max_length=12)
+
+
+class CreateUserRequest(BaseModel):
+    username: str = Field(..., min_length=3, max_length=40)
     role: str = Field(..., min_length=3, max_length=32)
-    credential: str = Field(..., min_length=1, max_length=256)
-    actor: str = Field(default="", max_length=80)
+    password: str = Field(..., min_length=12, max_length=128)
+
+
+class ParticipantRequest(BaseModel):
+    actor: str = Field(..., min_length=3, max_length=80)
+    role: str = Field(..., min_length=3, max_length=32)
 
 
 class CheckpointBody(BaseModel):
@@ -108,19 +135,22 @@ def create_bayora_app(db_path: Optional[str] = None, seed_demo_data: bool = Fals
         adapter = GeminiAdapter()
     else:
         adapter = DeterministicMockLLMAdapter()
-    with db.connection() as _c:
-        _c.execute("CREATE TABLE IF NOT EXISTS revoked_tokens (jti TEXT PRIMARY KEY, exp INTEGER NOT NULL)")
+    ensure_tables(db)
     app = BayoraRouterApp(title="Bayora Systems — Adversarial AI Safety Control Plane", version="1.0.0")
     app.db = db  # exposed so tests/shutdown can close connections
     adapter_is_mock = "MOCK" in adapter.ADAPTER_TYPE
 
-    _unauth_last = {"t": 0.0}
-
-    def _unauth_audit(**kw: Any) -> None:  # at most 1 unauthenticated audit row per second (flood protection)
-        import time as _t
-        if _t.time() - _unauth_last["t"] >= 1.0:
-            _unauth_last["t"] = _t.time()
-            audit.record(**kw)
+    def _unauth_audit(**kw: Any) -> None:  # at most 1 unauthenticated audit row per second, persisted in the DB
+        with db.connection() as c:
+            last = c.execute("SELECT timestamp FROM audit_events WHERE role = 'UNAUTHENTICATED' ORDER BY rowid DESC LIMIT 1").fetchone()
+        if last:
+            try:
+                age = (datetime.now(timezone.utc) - datetime.fromisoformat(last["timestamp"])).total_seconds()
+                if age < 1.0:
+                    return
+            except ValueError:
+                pass
+        audit.record(**kw)
 
     def _require_auth(request: RequestContext, test_id: str, action: str, resource: str) -> ActorIdentity:
         try:
@@ -130,6 +160,14 @@ def create_bayora_app(db_path: Optional[str] = None, seed_demo_data: bool = Fals
                     if c.execute("SELECT 1 FROM revoked_tokens WHERE jti = ?", (ident.jti,)).fetchone():
                         raise HTTPException(status_code=401, detail={"error": "AUTHENTICATION_FAILED",
                                             "code": "AUTH_TOKEN_REVOKED", "message": "Token was revoked."})
+            with db.connection() as c:
+                u = c.execute("SELECT disabled, valid_after FROM users WHERE username = ?", (ident.actor,)).fetchone()
+            if u and u["disabled"]:
+                raise HTTPException(status_code=401, detail={"error": "AUTHENTICATION_FAILED", "code": "AUTH_ACCOUNT_DISABLED",
+                                                              "message": "Account disabled."})
+            if u and ident.iat <= u["valid_after"]:
+                raise HTTPException(status_code=401, detail={"error": "AUTHENTICATION_FAILED", "code": "AUTH_TOKEN_SUPERSEDED",
+                                                              "message": "Session ended by a password/account change. Sign in again."})
             return ident
         except HTTPException as exc:
             _unauth_audit(  # never log caller-claimed role/actor: they are unverified
@@ -167,14 +205,174 @@ def create_bayora_app(db_path: Optional[str] = None, seed_demo_data: bool = Fals
 
     @app.post("/api/auth/login")
     def login_route(request: RequestContext, body: LoginRequest) -> Dict[str, Any]:
-        """Exchange a per-role credential for a signed, expiring bearer token."""
+        """Per-person login (username+password) or shared role credential. Returns a signed expiring token."""
         try:
-            token = auth_login(body.role, body.credential, body.actor)
+            if body.username:
+                token, role = login_user(db, body.username, body.credential, body.otp)
+            else:
+                if os.environ.get("BAYORA_DISABLE_ROLE_CREDENTIALS") == "1":
+                    raise HTTPException(status_code=403, detail={"error": "AUTHENTICATION_FAILED", "code": "ROLE_CREDENTIALS_DISABLED",
+                                                                 "message": "Sign in with a personal account."})
+                token, role = auth_login(body.role, body.credential, body.actor, db)
         except HTTPException:
             _unauth_audit(test_id="GLOBAL", actor="unauthenticated", role="UNAUTHENTICATED",
-                         action="LOGIN", resource="/api/auth/login", decision="DENY", reason_code="AUTH_LOGIN_FAILED")
+                          action="LOGIN", resource="/api/auth/login", decision="DENY", reason_code="AUTH_LOGIN_FAILED")
             raise
-        return {"token": token, "token_type": "Bearer"}
+        return {"token": token, "token_type": "Bearer", "role": role}
+
+    def _require_evaluator(request: RequestContext, action: str, resource: str) -> ActorIdentity:
+        ident = _require_auth(request, test_id="GLOBAL", action=action, resource=resource)
+        if ident.role != Role.EVALUATOR:
+            audit.record(test_id="GLOBAL", actor=ident.actor, role=ident.role.value, action=action, resource=resource,
+                         decision="DENY", reason_code="EVALUATOR_ONLY")
+            raise HTTPException(status_code=403, detail={"error": "FORBIDDEN", "code": "EVALUATOR_ONLY", "message": "Evaluator only."})
+        return ident
+
+    @app.post("/api/users")
+    def create_user_route(request: RequestContext, body: CreateUserRequest) -> Dict[str, Any]:
+        ident = _require_evaluator(request, "CREATE_USER", "/api/users")
+        try:
+            role = Role(body.role.strip().upper())
+            create_user(db, body.username.strip(), role, body.password)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail={"error": "VALIDATION_ERROR", "code": "USER_INVALID", "message": str(exc)})
+        audit.record(test_id="GLOBAL", actor=ident.actor, role=ident.role.value, action="CREATE_USER",
+                     resource=f"user:{body.username.strip()}", decision="ALLOW", reason_code="USER_CREATED")
+        return {"username": body.username.strip(), "role": role.value}
+
+    @app.get("/api/users")
+    def list_users_route(request: RequestContext) -> Dict[str, Any]:
+        _require_evaluator(request, "LIST_USERS", "/api/users")
+        with db.connection() as c:
+            rows = c.execute("SELECT username, role, created_at FROM users ORDER BY username").fetchall()
+        return {"users": [dict(r) for r in rows]}  # never includes password hashes
+
+    def _personal(ident: ActorIdentity) -> Any:
+        with db.connection() as c:
+            row = c.execute("SELECT username, pw_hash, totp_pending FROM users WHERE username = ?", (ident.actor,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=400, detail={"error": "NOT_A_PERSONAL_ACCOUNT", "code": "NOT_A_PERSONAL_ACCOUNT",
+                                                         "message": "Only personal accounts support this action."})
+        return row
+
+    def _audit_ok(ident: ActorIdentity, action: str, resource: str, reason: str) -> None:
+        audit.record(test_id="GLOBAL", actor=ident.actor, role=ident.role.value, action=action, resource=resource,
+                     decision="ALLOW", reason_code=reason)
+
+    def _target_user(username: str) -> None:
+        with db.connection() as c:
+            if not c.execute("SELECT 1 FROM users WHERE username = ?", (username,)).fetchone():
+                raise HTTPException(status_code=404, detail={"error": "NOT_FOUND", "code": "USER_NOT_FOUND", "message": "No such user."})
+
+    @app.post("/api/auth/password")
+    def change_password(request: RequestContext, body: PasswordChangeRequest) -> Dict[str, Any]:
+        ident = _require_auth(request, test_id="GLOBAL", action="CHANGE_PASSWORD", resource="/api/auth/password")
+        row = _personal(ident)
+        _throttle_or_fail(db, f"pw:{ident.actor.lower()}", verify_password(body.current_password, row["pw_hash"]))
+        set_password(db, ident.actor, body.new_password)
+        _audit_ok(ident, "CHANGE_PASSWORD", "/api/auth/password", "PASSWORD_CHANGED")
+        return {"changed": True, "message": "All earlier sessions are now invalid. Sign in again."}
+
+    @app.post("/api/users/{username}/reset-password")
+    def reset_password(request: RequestContext, username: str, body: ResetPasswordRequest) -> Dict[str, Any]:
+        ident = _require_evaluator(request, "RESET_PASSWORD", f"user:{username}")
+        _target_user(username)
+        set_password(db, username, body.new_password)
+        _audit_ok(ident, "RESET_PASSWORD", f"user:{username}", "PASSWORD_RESET_BY_EVALUATOR")
+        return {"reset": True}
+
+    @app.post("/api/users/{username}/disable")
+    def disable_user(request: RequestContext, username: str) -> Dict[str, Any]:
+        ident = _require_evaluator(request, "DISABLE_USER", f"user:{username}")
+        _target_user(username)
+        if username == ident.actor:
+            raise HTTPException(status_code=422, detail={"error": "VALIDATION_ERROR", "code": "CANNOT_DISABLE_SELF", "message": "You cannot disable yourself."})
+        import time as _t
+        with db.connection() as c:
+            c.execute("UPDATE users SET disabled = 1, valid_after = ? WHERE username = ?", (int(_t.time() * 1000), username))
+        _audit_ok(ident, "DISABLE_USER", f"user:{username}", "USER_DISABLED")
+        return {"disabled": True}
+
+    @app.post("/api/users/{username}/enable")
+    def enable_user(request: RequestContext, username: str) -> Dict[str, Any]:
+        ident = _require_evaluator(request, "ENABLE_USER", f"user:{username}")
+        _target_user(username)
+        with db.connection() as c:
+            c.execute("UPDATE users SET disabled = 0 WHERE username = ?", (username,))
+        _audit_ok(ident, "ENABLE_USER", f"user:{username}", "USER_ENABLED")
+        return {"disabled": False}
+
+    @app.post("/api/users/{username}/mfa/reset")
+    def reset_mfa(request: RequestContext, username: str) -> Dict[str, Any]:
+        ident = _require_evaluator(request, "RESET_MFA", f"user:{username}")
+        _target_user(username)
+        import time as _t
+        with db.connection() as c:
+            c.execute("UPDATE users SET totp_secret = NULL, totp_pending = NULL, totp_last = 0, valid_after = ? WHERE username = ?",
+                      (int(_t.time() * 1000), username))
+        _audit_ok(ident, "RESET_MFA", f"user:{username}", "MFA_RESET_BY_EVALUATOR")
+        return {"mfa_enabled": False}
+
+    @app.post("/api/auth/mfa/enroll")
+    def mfa_enroll(request: RequestContext) -> Dict[str, Any]:
+        ident = _require_auth(request, test_id="GLOBAL", action="MFA_ENROLL", resource="/api/auth/mfa/enroll")
+        _personal(ident)
+        secret = new_totp_secret()
+        with db.connection() as c:
+            c.execute("UPDATE users SET totp_pending = ? WHERE username = ?", (secret, ident.actor))
+        _audit_ok(ident, "MFA_ENROLL", "/api/auth/mfa/enroll", "MFA_ENROLL_STARTED")
+        return {"secret": secret, "otpauth_uri": f"otpauth://totp/Bayora:{ident.actor}?secret={secret}&issuer=Bayora",
+                "message": "Add this to an authenticator app, then confirm with a code. MFA is not active until confirmed."}
+
+    @app.post("/api/auth/mfa/confirm")
+    def mfa_confirm(request: RequestContext, body: MfaConfirmRequest) -> Dict[str, Any]:
+        ident = _require_auth(request, test_id="GLOBAL", action="MFA_CONFIRM", resource="/api/auth/mfa/confirm")
+        row = _personal(ident)
+        counter = verify_totp(row["totp_pending"], body.code.strip()) if row["totp_pending"] else None
+        _throttle_or_fail(db, f"mfa:{ident.actor.lower()}", counter is not None)
+        with db.connection() as c:
+            c.execute("UPDATE users SET totp_secret = totp_pending, totp_pending = NULL, totp_last = ? WHERE username = ?", (counter, ident.actor))
+        _audit_ok(ident, "MFA_CONFIRM", "/api/auth/mfa/confirm", "MFA_ENABLED")
+        return {"mfa_enabled": True}
+
+    @app.post("/api/tests/{id}/participants")
+    def add_participant(request: RequestContext, id: str, body: ParticipantRequest) -> Dict[str, Any]:
+        ident = _require_evaluator(request, "ASSIGN_PARTICIPANT", f"test:{id}/participants")
+        _get_test_or_404(id)
+        try:
+            role = Role(body.role.strip().upper())
+            if role == Role.EVALUATOR:
+                raise ValueError
+        except ValueError:
+            raise HTTPException(status_code=422, detail={"error": "VALIDATION_ERROR", "code": "PARTICIPANT_ROLE_INVALID",
+                                                         "message": "role must be RED_TEAM or BLUE_TEAM."})
+        with db.connection() as c:
+            c.execute("INSERT OR IGNORE INTO test_participants (test_id, role, actor) VALUES (?, ?, ?)",
+                      (id, role.value, body.actor.strip()))
+        audit.record(test_id=id, actor=ident.actor, role=ident.role.value, action="ASSIGN_PARTICIPANT",
+                     resource=f"test:{id}/participants", decision="ALLOW", reason_code="PARTICIPANT_ASSIGNED")
+        return {"test_id": id, "actor": body.actor.strip(), "role": role.value}
+
+    @app.get("/api/tests/{id}/participants")
+    def list_participants(request: RequestContext, id: str) -> Dict[str, Any]:
+        _require_evaluator(request, "LIST_PARTICIPANTS", f"test:{id}/participants")
+        _get_test_or_404(id)
+        with db.connection() as c:
+            rows = c.execute("SELECT role, actor FROM test_participants WHERE test_id = ? ORDER BY role, actor", (id,)).fetchall()
+        return {"participants": [dict(r) for r in rows]}
+
+    def _enforce_assignment(test_id: str, identity: ActorIdentity, required_role: Role, action: str) -> None:
+        """If the evaluator assigned people of this role to the test, only they may touch its artifacts.
+        A test with NO assigned people of that role stays open to the role (legacy/demo behaviour)."""
+        if identity.role != required_role:
+            return  # role policy handles other roles
+        with db.connection() as c:
+            rows = c.execute("SELECT actor FROM test_participants WHERE test_id = ? AND role = ?", (test_id, required_role.value)).fetchall()
+        if rows and identity.actor not in {r["actor"] for r in rows}:
+            audit.record(test_id=test_id, actor=identity.actor, role=identity.role.value, action=action,
+                         resource=f"test:{test_id}", decision="DENY", reason_code="NOT_ASSIGNED_TO_TEST")
+            raise HTTPException(status_code=403, detail={"error": "FORBIDDEN", "code": "NOT_ASSIGNED_TO_TEST",
+                                                         "message": "You are not assigned to this test."})
 
     @app.post("/api/auth/logout")
     def logout_route(request: RequestContext) -> Dict[str, Any]:
@@ -227,8 +425,14 @@ def create_bayora_app(db_path: Optional[str] = None, seed_demo_data: bool = Fals
                 """
             ).fetchall()
             tests_list = []
+            assigned = {}
+            for pr in conn.execute("SELECT test_id, role, actor FROM test_participants").fetchall():
+                assigned.setdefault((pr["test_id"], pr["role"]), set()).add(pr["actor"])
             for r in rows:
                 d = dict(r)
+                mine = assigned.get((d["id"], identity.role.value))
+                if identity.role != Role.EVALUATOR and mine and identity.actor not in mine:
+                    continue  # tests you are not assigned to are invisible to you
                 p_cnt = conn.execute("SELECT COUNT(*) AS c FROM red_payloads WHERE test_id = ?", (d["id"],)).fetchone()["c"]
                 b_cnt = conn.execute("SELECT COUNT(*) AS c FROM blue_defenses WHERE test_id = ?", (d["id"],)).fetchone()["c"]
                 d["red_payload_count"] = p_cnt
@@ -429,6 +633,7 @@ def create_bayora_app(db_path: Optional[str] = None, seed_demo_data: bool = Fals
                 },
             )
 
+        _enforce_assignment(id, identity, Role.RED_TEAM, "SUBMIT_RED_PAYLOAD")
         _reject_enum(id, identity, "SUBMIT_RED_PAYLOAD", f"test:{id}/payloads",
                      [("category", body.category, ALLOWED_CATEGORIES), ("severity_tier", body.severity_tier, ALLOWED_SEVERITIES)])
         payload_id = f"red-pld-{uuid.uuid4().hex[:10]}"
@@ -491,6 +696,7 @@ def create_bayora_app(db_path: Optional[str] = None, seed_demo_data: bool = Fals
         identity = _require_auth(request, test_id=id, action="READ_RED_PAYLOAD", resource=f"test:{id}/payloads")
         test_row = _get_test_or_404(id)
 
+        _enforce_assignment(id, identity, Role.RED_TEAM, "READ_RED_PAYLOADS")
         allowed, reason = check_can_read_red_payloads(identity.role, test_row["state"])
         if not allowed:
             audit.record(
@@ -567,6 +773,7 @@ def create_bayora_app(db_path: Optional[str] = None, seed_demo_data: bool = Fals
                 },
             )
 
+        _enforce_assignment(id, identity, Role.BLUE_TEAM, "SUBMIT_BLUE_DEFENSE")
         _reject_enum(id, identity, "SUBMIT_BLUE_DEFENSE", f"test:{id}/defenses",
                      [("rule_type", body.rule_type, ALLOWED_RULE_TYPES)])
         defense_id = f"blu-def-{uuid.uuid4().hex[:10]}"
@@ -629,6 +836,7 @@ def create_bayora_app(db_path: Optional[str] = None, seed_demo_data: bool = Fals
         identity = _require_auth(request, test_id=id, action="READ_BLUE_DEFENSE", resource=f"test:{id}/defenses")
         test_row = _get_test_or_404(id)
 
+        _enforce_assignment(id, identity, Role.BLUE_TEAM, "READ_BLUE_DEFENSES")
         allowed, reason = check_can_read_blue_defenses(identity.role, test_row["state"])
         if not allowed:
             audit.record(

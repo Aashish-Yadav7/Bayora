@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useState } from 'react';
+import LoginDialog from './components/LoginDialog';
 import {
   BayoraRole,
   ROLE_DESCRIPTORS,
@@ -55,38 +56,38 @@ export default function App() {
   const [suiteResult, setSuiteResult] = useState<SecuritySuiteResponse | null>(null);
   const [runningSuite, setRunningSuite] = useState(false);
 
-  const signIn = useCallback(async (role: BayoraRole) => {
-    const credential = window.prompt(`Enter the ${role} credential`);
-    if (!credential) return;
-    const res = await fetch('/api/auth/login', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ role, credential, }),
-    });
-    if (res.ok) {
-      sessionStorage.setItem(`bayora_token_${role}`, (await res.json()).token);
-      window.location.reload();
-    } else {
-      window.alert('Sign-in failed');
-    }
-  }, []);
+  const [showLogin, setShowLogin] = useState(false);
+
+  // Session lives in an HttpOnly cookie set by the gateway, so no token is ever readable by page scripts.
+  const doLogin = useCallback(
+    async (username: string, credential: string, otp: string): Promise<string | null> => {
+      const res = await fetch('/api/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'bayora' },
+        body: JSON.stringify({ role: activeRole, credential, username, otp }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok) {
+        sessionStorage.setItem('bayora_active_role', data.role);
+        window.location.reload();
+        return null;
+      }
+      if (data.code === 'AUTH_OTP_REQUIRED') return 'OTP_REQUIRED';
+      return data.message || 'Sign-in failed';
+    },
+    [activeRole]
+  );
 
   const signOut = useCallback(async () => {
-    const token = sessionStorage.getItem(`bayora_token_${activeRole}`);
-    if (token) {
-      await fetch('/api/auth/logout', { method: 'POST', headers: { Authorization: `Bearer ${token}` } });
-      sessionStorage.removeItem(`bayora_token_${activeRole}`);
-    }
+    await fetch('/api/auth/logout', { method: 'POST', headers: { 'X-Requested-With': 'bayora' } });
     window.location.reload();
-  }, [activeRole]);
+  }, []);
 
   const downloadReport = useCallback(async () => {
     if (!selectedTestId) return window.alert('Select a test first');
-    const token = sessionStorage.getItem('bayora_token_EVALUATOR');
-    const headers: Record<string, string> = token
-      ? { Authorization: `Bearer ${token}` }
-      : { 'X-Bayora-Role': 'EVALUATOR', 'X-Bayora-Actor': 'evaluator-report' };
-    const res = await fetch(`/api/tests/${selectedTestId}/report`, { headers });
+    const res = await fetch(`/api/tests/${selectedTestId}/report`, {
+      headers: { 'X-Requested-With': 'bayora', 'X-Bayora-Role': 'EVALUATOR', 'X-Bayora-Actor': 'evaluator-report' },
+    });
     if (!res.ok) return window.alert('Report unavailable: evaluator sign-in and released results are required');
     const url = URL.createObjectURL(new Blob([JSON.stringify(await res.json(), null, 2)], { type: 'application/json' }));
     const a = document.createElement('a');
@@ -99,12 +100,9 @@ export default function App() {
   const getRoleHeaders = useCallback(
     (overrideRole?: BayoraRole): Record<string, string> => {
       const r = overrideRole || activeRole;
-      const token = sessionStorage.getItem(`bayora_token_${r}`);
-      if (token) {
-        return { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` };
-      }
       return {
         'Content-Type': 'application/json',
+        'X-Requested-With': 'bayora',
         'X-Bayora-Role': r,
         'X-Bayora-Actor': ROLE_DESCRIPTORS[r].defaultActor,
       };
@@ -546,11 +544,14 @@ export default function App() {
               </div>
               <button
                 type="button"
-                onClick={() => signIn(activeRole)}
+                onClick={() => setShowLogin(true)}
                 className="w-full text-xs rounded border border-slate-700 px-2 py-1 text-slate-300 hover:bg-slate-800"
               >
                 Sign in as {activeRole} (secure mode)
               </button>
+              {showLogin && (
+                <LoginDialog role={activeRole} onClose={() => setShowLogin(false)} onSubmit={doLogin} />
+              )}
               <div className="grid grid-cols-2 gap-1.5">
                 <button type="button" onClick={signOut}
                   className="text-xs rounded border border-slate-700 px-2 py-1 text-slate-300 hover:bg-slate-800">

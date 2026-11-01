@@ -139,6 +139,7 @@ services:
     environment:
       - BAYORA_BACKEND_URL=http://control-plane:8000
       - BAYORA_DEV_HEADER_AUTH=${BAYORA_DEV_HEADER_AUTH:-0}
+      - BAYORA_COOKIE_SECURE=${BAYORA_COOKIE_SECURE:-0}
       - BAYORA_RED_WORKER_TOKEN=${BAYORA_RED_WORKER_TOKEN:?set BAYORA_RED_WORKER_TOKEN}
       - BAYORA_BLUE_WORKER_TOKEN=${BAYORA_BLUE_WORKER_TOKEN:?set BAYORA_BLUE_WORKER_TOKEN}
       - BAYORA_EVALUATOR_TOKEN=${BAYORA_EVALUATOR_TOKEN:?set BAYORA_EVALUATOR_TOKEN}
@@ -158,6 +159,29 @@ services:
         limits:
           cpus: "0.50"
           memory: 512M
+
+  tls-proxy:
+    profiles: ["tls"]
+    image: caddy:2.8-alpine
+    user: "10005:10005"
+    read_only: true
+    tmpfs:
+      - /tmp
+    environment:
+      - XDG_DATA_HOME=/tmp/caddy-data
+      - XDG_CONFIG_HOME=/tmp/caddy-config
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+    ports:
+      - "8443:8443"
+    networks:
+      - control-net
+    depends_on:
+      - frontend
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
 
 networks:
   red-net:

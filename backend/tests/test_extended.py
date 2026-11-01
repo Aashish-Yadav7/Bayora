@@ -46,7 +46,6 @@ class Base(unittest.TestCase):
         for k in CLEAR:
             os.environ.pop(k, None)
         os.environ.update(ENV)
-        auth._FAILS.clear()
         self.app = create_bayora_app(db_path=":memory:", seed_demo_data=False)
         self.addCleanup(self.app.db.close)
         self.c = TestClient(self.app)
